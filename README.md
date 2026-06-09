@@ -53,6 +53,8 @@ nvidia-ctk cdi list   # should show nvidia.com/gpu=0, =1, =all
 
 ## Install
 
+See [`QUICKSTART.md`](QUICKSTART.md) for the 15-minute setup. Short version:
+
 ```bash
 git clone https://github.com/postfix/video-upscale-toolkit.git
 cd video-upscale-toolkit
