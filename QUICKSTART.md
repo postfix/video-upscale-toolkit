@@ -100,6 +100,8 @@ video2x in.mp4 out.mp4 --model lsdir-plus     # modern general default
 
 ## Troubleshooting
 
+Short list — see [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the full set.
+
 - **`v2x-...: profile 'X' not found`** — run `v2x-install-models` first.
 - **`uav: models not installed`** — see step 4 above.
 - **`vkEnumeratePhysicalDevices failed -3`** — CDI spec missing or stale;
@@ -108,3 +110,6 @@ video2x in.mp4 out.mp4 --model lsdir-plus     # modern general default
   the image: `podman build --no-cache -t localhost/uav:latest containers/uav/`.
 - **UAV OOMs at decode** — check `nvidia-smi` for other processes hogging
   GPU 1; UAV's multi-GPU split needs both cards mostly-free.
+- **UAV `av.error.BlockingIOError: Resource temporarily unavailable`** —
+  the wrapper auto-fixes this. If you've disabled with `--no-retag`, pre-tag
+  the input with bt709 metadata yourself (see TROUBLESHOOTING.md).

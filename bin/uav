@@ -21,6 +21,8 @@ OPTIONS
       --no-tile                disable tiling (faster but more VRAM)
       --use-video-vae          use the lighter video VAE (vs. 3D VAE)
       --color-fix MODE         None | AdaIn | Wavelet (default: AdaIn)
+      --no-retag               skip the colorspace-tag pre-check (advanced; see docs/TROUBLESHOOTING.md)
+      --retag                  force re-tag even if metadata looks fine
   -n  --noise-level N          default 120
   -g  --guidance-scale N       default 6
   -s  --inference-steps N      default 30 (default mode), 50 (--deep)
@@ -57,6 +59,7 @@ STEPS=""
 PROMPT=""
 NEG_PROMPT=""
 DO_SHELL=0
+RETAG_MODE="auto"   # auto | force | off
 EXTRA=()
 POSITIONAL=()
 PASSTHROUGH=0
@@ -78,6 +81,8 @@ while [[ $# -gt 0 ]]; do
     -s|--inference-steps)   STEPS="$2"; shift 2 ;;
     --prompt)               PROMPT="$2"; shift 2 ;;
     --neg-prompt)           NEG_PROMPT="$2"; shift 2 ;;
+    --retag)                RETAG_MODE="force"; shift ;;
+    --no-retag)             RETAG_MODE="off"; shift ;;
     --)                     PASSTHROUGH=1; shift ;;
     -*)                     EXTRA+=("$1"); shift ;;
     *)                      POSITIONAL+=("$1"); shift ;;
@@ -118,6 +123,76 @@ OUT_ABS="$(readlink -f -- "$OUTPUT")"
 }
 
 mkdir -p "$CACHE_DIR"
+
+# ---------------------------------------------------------------------------
+# Auto-tag colorspace metadata.
+#
+# UAV reads video via torchvision.io.read_video → PyAV. Recent PyAV/swscale
+# refuses yuv420p→rgb24 conversion when the source lacks color_primaries /
+# transfer / colorspace tags, failing with "Resource temporarily unavailable".
+# We detect that and either bitstream-patch (for h264/hevc — instant, no
+# re-encode) or losslessly re-encode (other codecs). Tagged copies live in
+# $CACHE_DIR/tagged/ keyed by source size+mtime so repeat runs skip the work.
+#
+# Disable with --no-retag, force a re-tag with --retag.
+# ---------------------------------------------------------------------------
+uav_needs_color_tags() {
+  local f="$1" cs prim trc
+  IFS=',' read -r cs prim trc < <(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=color_space,color_primaries,color_transfer \
+    -of csv=p=0 "$f" 2>/dev/null)
+  [[ -z "$cs" || "$cs" == "unknown" || \
+     -z "$prim" || "$prim" == "unknown" || \
+     -z "$trc" || "$trc" == "unknown" ]]
+}
+
+uav_apply_color_tags() {
+  local in="$1" out="$2" codec
+  codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 "$in" 2>/dev/null || echo "")
+  case "$codec" in
+    h264)
+      ffmpeg -nostdin -hide_banner -loglevel warning -y -i "$in" \
+        -map 0 -c copy \
+        -bsf:v "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1" \
+        "$out" ;;
+    hevc)
+      ffmpeg -nostdin -hide_banner -loglevel warning -y -i "$in" \
+        -map 0 -c copy \
+        -bsf:v "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1" \
+        "$out" ;;
+    *)
+      # fallback: lossless x264 re-encode with explicit bt709 tags
+      ffmpeg -nostdin -hide_banner -loglevel warning -y -i "$in" \
+        -map 0:v:0 -map 0:a? \
+        -c:v libx264 -crf 0 -preset ultrafast \
+        -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+        -pix_fmt yuv420p -c:a copy \
+        "$out" ;;
+  esac
+}
+
+if [[ "$RETAG_MODE" != "off" ]] && command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+  if [[ "$RETAG_MODE" == "force" ]] || uav_needs_color_tags "$INPUT_ABS"; then
+    TAGGED_DIR="$CACHE_DIR/tagged"
+    mkdir -p "$TAGGED_DIR"
+    # cache key: size + mtime of source (cheap, unique enough)
+    key=$(stat -c "%s-%Y" "$INPUT_ABS" 2>/dev/null || echo "0-0")
+    tagged_name="${IN_BASE%.*}.bt709.${key}.${IN_BASE##*.}"
+    tagged_path="$TAGGED_DIR/$tagged_name"
+    if [[ "$RETAG_MODE" == "force" || ! -f "$tagged_path" ]]; then
+      echo "→ uav: input missing colorspace tags — patching ($(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT_ABS" 2>/dev/null))"
+      uav_apply_color_tags "$INPUT_ABS" "$tagged_path" || {
+        echo "uav: auto-retag failed; re-run with --no-retag and pre-process manually" >&2
+        rm -f "$tagged_path"
+        exit 1
+      }
+    fi
+    INPUT_ABS="$tagged_path"
+    IN_DIR="$TAGGED_DIR"
+    IN_BASE="$tagged_name"
+  fi
+fi
 
 # Build UAV argv
 ARGS=(
