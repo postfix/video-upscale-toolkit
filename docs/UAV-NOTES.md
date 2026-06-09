@@ -26,6 +26,7 @@ for 4 frames at 320×240.
 | 2 | VAE → BF16 (not FP16) | sed at lines 107/111 of `inference_upscale_a_video.py` | The script does `pipeline.unet = pipeline.unet.half()` but **never halves the VAE** — it stays FP32 from `from_config`. We can't use plain FP16: the VAE genuinely overflows ("invalid value encountered in cast" → all-black frames). **BF16 has the same exponent range as FP32** but half the memory of FP16 — exactly what we need. |
 | 3 | Skip the inline `self.vae.to(dtype=torch.float32)` | sed in `pipeline_upscale_a_video.py` | Inside the pipeline's `__call__`, the original code force-promotes the VAE to FP32 right before decode (legacy of the no-bf16-Ampere days). With patch #2 the VAE is already in bf16 with safe range — this promotion would defeat #2 and bring back the OOM. |
 | 4 | `short_seq = 1` (was 3) | sed in `pipeline_upscale_a_video.py` | The video VAE decodes `short_seq` frames per chunk. Temporal cross-attention scales **quadratically** with `short_seq`: 3 → 1 cuts the attention buffer 9× (~13 GB → ~1.5 GB). The cost is 3× more decode-loop iterations but each is tiny and fast. |
+| 5 | Replace `torchvision.io.read_video` with `cv2.VideoCapture` | `fix_utils.py` (run during build) replaces `read_frame_from_videos` in `utils.py` | torchvision → PyAV → swscale fails "EAGAIN" on many real-world inputs in this image. decord segfaults in `get_batch`. cv2 (already used by UAV's folder branch) is the only stable reader. |
 
 ## The chase, in order
 

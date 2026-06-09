@@ -76,7 +76,17 @@ RUN sed -i \
     sed -i \
     's|^        short_seq = 3$|        short_seq = 1  # PATCH: shrink VAE temporal attn buffer for 24 GB GPUs|' \
     /opt/Upscale-A-Video/models_video/pipeline_upscale_a_video.py && \
-    grep -q "PATCH: shrink VAE temporal" /opt/Upscale-A-Video/models_video/pipeline_upscale_a_video.py
+    grep -q "PATCH: shrink VAE temporal" /opt/Upscale-A-Video/models_video/pipeline_upscale_a_video.py && \
+    # PATCH #5: replace torchvision.io.read_video (PyAV+swscale "EAGAIN" on
+    # real-world videos) with cv2.VideoCapture. Decord — the other obvious
+    # alternative — segfaults on get_batch in this container env. cv2 is the
+    # folder-branch's existing reader, so we know it works.
+    true   # fix_utils.py is applied just below
+
+COPY fix_utils.py /tmp/fix_utils.py
+RUN python /tmp/fix_utils.py && \
+    grep -q "PATCH: cv2.VideoCapture" /opt/Upscale-A-Video/utils.py && \
+    rm /tmp/fix_utils.py
 
 # stage the model mount point so the bind-mount has a writable home
 RUN mkdir -p /opt/Upscale-A-Video/pretrained_models \

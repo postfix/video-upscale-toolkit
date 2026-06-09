@@ -173,15 +173,34 @@ uav_apply_color_tags() {
 }
 
 if [[ "$RETAG_MODE" != "off" ]] && command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
-  if [[ "$RETAG_MODE" == "force" ]] || uav_needs_color_tags "$INPUT_ABS"; then
+  codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 "$INPUT_ABS" 2>/dev/null || echo "")
+
+  # Decide whether to retag. For H.264/HEVC the BSF metadata patch is cheap
+  # (no re-encode, idempotent) so we always do it in auto mode — the older
+  # detect-then-tag approach missed partial/weird tags (e.g. bt709 colorspace
+  # but unknown range, or color_range=tv that PyAV's swscale still chokes on).
+  # For other codecs the retag is a lossless re-encode (slow + bulky), so we
+  # only do it when detection says it's needed.
+  retag=0
+  case "$RETAG_MODE" in
+    force) retag=1 ;;
+    auto)
+      case "$codec" in
+        h264|hevc) retag=1 ;;
+        *)         uav_needs_color_tags "$INPUT_ABS" && retag=1 ;;
+      esac ;;
+  esac
+
+  if [[ "$retag" == "1" ]]; then
     TAGGED_DIR="$CACHE_DIR/tagged"
     mkdir -p "$TAGGED_DIR"
-    # cache key: size + mtime of source (cheap, unique enough)
+    # cache key: codec + size + mtime; collisions impossible in practice
     key=$(stat -c "%s-%Y" "$INPUT_ABS" 2>/dev/null || echo "0-0")
-    tagged_name="${IN_BASE%.*}.bt709.${key}.${IN_BASE##*.}"
+    tagged_name="${IN_BASE%.*}.bt709.${codec}.${key}.${IN_BASE##*.}"
     tagged_path="$TAGGED_DIR/$tagged_name"
     if [[ "$RETAG_MODE" == "force" || ! -f "$tagged_path" ]]; then
-      echo "→ uav: input missing colorspace tags — patching ($(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT_ABS" 2>/dev/null))"
+      echo "→ uav: tagging input with bt709 colorspace (codec=$codec)"
       uav_apply_color_tags "$INPUT_ABS" "$tagged_path" || {
         echo "uav: auto-retag failed; re-run with --no-retag and pre-process manually" >&2
         rm -f "$tagged_path"

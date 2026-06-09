@@ -11,48 +11,54 @@ is for when they don't, or when you want to understand what they're doing.
 ```
 [multi_gpu_setup] UNet/text_encoder → cuda:0, VAE → cuda:1
 Failed initializing scaling graph (Resource temporarily unavailable):
-  fmt:yuv420p csp:unknown prim:unknown trc:unknown -> fmt:rgb24 csp:gbr ...
+  fmt:yuv420p csp:... prim:... trc:... -> fmt:rgb24 csp:gbr ...
 av.error.BlockingIOError: [Errno 11] Resource temporarily unavailable
   ...torchvision/io/video.py", line 324, in read_video
 ```
 
 Note that this happens *after* the multi-GPU banner — UAV initialized fine,
-the failure is upstream of the model in the video-reading step.
+the failure is upstream of the model in the video-reading step. Persists even
+when the source has perfectly fine `color_primaries / color_trc / colorspace`
+metadata — the swscale init genuinely refuses for other reasons (likely a
+PyAV 17 / FFmpeg 7 incompatibility specific to our build).
 
 **Root cause**
 
-UAV's `utils.py` uses `torchvision.io.read_video()` which delegates to PyAV
-(the Python `av` package). The upstream UAV requirements pin `av==9.1.0` but
-that version won't build on Debian 13 (Cython incompatibility with modern
-ffmpeg headers), so our container ships `av` 17.x. PyAV 17 + recent swscale
-refuses to set up a `yuv420p (csp:unknown) → rgb24` conversion when the input
-has no `color_primaries / color_trc / colorspace` metadata. The error
-message's "Resource temporarily unavailable" is misleading — it's a strict
-swscale-init failure, not actual I/O contention.
+UAV's `utils.py` calls `torchvision.io.read_video()` → PyAV → swscale. The
+upstream UAV requirements pin `av==9.1.0` but that version doesn't build
+on Debian 13 (Cython API drift), so our container ships `av` 17.x. The
+combination + this image's libav silently fails swscale init for many
+real-world inputs. Decord — the obvious alternative — segfaults during
+`get_batch()` in this same container image.
 
-**Auto-fix (default)**
+**Fix (baked into the container — patch #5 in the Dockerfile)**
 
-The `uav` wrapper detects missing color tags via `ffprobe` and either:
+The Dockerfile applies `fix_utils.py` at build time, which replaces
+`read_frame_from_videos` to use `cv2.VideoCapture` instead. cv2 is the same
+reader UAV already uses in the folder-of-images branch of the same function,
+so semantics are identical — except cv2 is stable, where torchvision and
+decord are not.
 
-1. **Patches the bitstream metadata** for H.264 / HEVC sources — instant,
-   no re-encode (uses `h264_metadata` / `hevc_metadata` BSF with
-   `colour_primaries=1 transfer_characteristics=1 matrix_coefficients=1`,
-   i.e. BT.709).
-2. **Losslessly re-encodes** (libx264 `-crf 0 -preset ultrafast`) for any
-   other codec, with explicit `-color_primaries bt709 -color_trc bt709
-   -colorspace bt709 -pix_fmt yuv420p` flags.
-
-Tagged copies are cached under `~/.cache/uav/tagged/` keyed by source
-size+mtime, so re-runs on the same file skip the work.
-
-**Manual override**
+After rebuild you should see the patched function:
 
 ```bash
-uav clip.mp4 ./out --no-retag        # disable auto-fix entirely
-uav clip.mp4 ./out --retag           # force re-tag even if metadata looks fine
+podman run --rm --entrypoint head localhost/uav:latest -20 /opt/Upscale-A-Video/utils.py
+# expect:  # PATCH: cv2.VideoCapture instead of torchvision.io.read_video.
 ```
 
-To pre-tag a video yourself (when running UAV some other way):
+**`uav --retag` / `--no-retag` flags**
+
+The wrapper *also* has an auto-color-tag step (BSF patch for H.264/HEVC,
+lossless re-encode for other codecs), cached at `~/.cache/uav/tagged/`. With
+the cv2 patch this is mostly cosmetic — cv2 doesn't care about color tags —
+but it's cheap (~1 s per file, cached) and harmless. Toggle with:
+
+```bash
+uav clip.mp4 ./out --no-retag      # disable auto-tag (smaller cache, same result)
+uav clip.mp4 ./out --retag         # force re-tag (debug only)
+```
+
+If you ever need to manually pre-tag a video for another tool:
 
 ```bash
 # H.264 / HEVC — bitstream patch, no re-encode, takes seconds:
