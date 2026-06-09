@@ -87,6 +87,7 @@ uav clip.mp4 ./out --prompt "vintage 1980s home video, film grain"
 ```
 
 Full recipes are in [`docs/CHEATSHEET.md`](docs/CHEATSHEET.md).
+Diffusion prompts for `uav` are in [`docs/PROMPTS.md`](docs/PROMPTS.md).
 The story behind the UAV patches is in [`docs/UAV-NOTES.md`](docs/UAV-NOTES.md).
 
 ## Why these tools, why this hardware
