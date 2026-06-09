@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# v2x-nsfw — adult / live-action preset, skin-tone focused
+# Uses the `nsfw` profile: realesrgan-plus slot → foolhardy Remacri (preserves
+# skin texture without over-sharpening pores; the community standard for NSFW
+# upscaling). x265 10-bit eliminates gradient banding common in soft lighting.
+# Setup once: v2x-install-models
+PROFILE_DIR="$HOME/.local/share/video2x/profiles/nsfw/realesrgan"
+PROFILE_ARGS=()
+[[ -d "$PROFILE_DIR" ]] && PROFILE_ARGS=( --profile nsfw )
+exec video2x \
+  "${PROFILE_ARGS[@]}" \
+  --realesrgan-model realesrgan-plus \
+  -s 4 \
+  -c libx265 \
+  "$@" \
+  -- --pix-fmt yuv420p10le -e crf=20 -e preset=slow

@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# video2x — podman wrapper around ghcr.io/k4yt3x/video2x
+# Defaults: RealESRGAN 4x with the realesr-animevideov3 model on all NVIDIA GPUs.
+set -euo pipefail
+
+IMAGE="${VIDEO2X_IMAGE:-ghcr.io/k4yt3x/video2x:6.4.0}"
+PROFILE=""
+
+PROCESSOR="realesrgan"
+SCALE="4"
+RE_MODEL="realesr-animevideov3"
+RC_MODEL=""
+RIFE_MODEL=""
+SHADER=""
+DEVICE=""
+WIDTH=""
+HEIGHT=""
+INTERP=""
+CODEC=""
+EXTRA=()
+DO_LIST=0
+DO_PULL=0
+DO_SHELL=0
+DUAL_GPU=0
+
+usage() {
+  cat <<'EOF'
+video2x — podman wrapper for ghcr.io/k4yt3x/video2x
+
+USAGE
+  video2x [OPTIONS] INPUT OUTPUT [-- <raw video2x flags>]
+  video2x --list-devices
+  video2x --pull              # update the container image
+  video2x --shell             # interactive shell in the container (cwd → /host)
+
+UPSCALE OPTIONS
+  -p, --processor NAME        realesrgan | realcugan | libplacebo            (default: realesrgan)
+  -s, --scale N               scaling factor: 2, 3, 4                        (default: 4)
+  -w, --width  PX             explicit output width  (overrides --scale)
+  -H, --height PX             explicit output height (overrides --scale)
+      --realesrgan-model M    realesr-animevideov3 | realesrgan-plus-anime | realesrgan-plus
+      --realcugan-model  M    models-se | models-pro | models-nose
+      --libplacebo-shader S   anime4k-v4-a | anime4k-v4-a+a | anime4k-v4-b | ... | path.glsl
+
+INTERPOLATION OPTIONS
+  -m, --multiplier N          frame-rate multiplier (forces processor=rife)
+      --rife-model M          rife-v4.6 (default) | rife-v4.26 | rife-anime | ...
+
+GPU / IMAGE / ENCODER
+  -d, --device IDX            Vulkan device index (default: 0; see --list-devices)
+  -c, --codec C               output codec passed to FFmpeg (e.g. libx264, libx265, hevc_nvenc)
+      --image REF             override container image (default: $VIDEO2X_IMAGE or ghcr.io/k4yt3x/video2x:6.4.0)
+  -h, --help                  show this help (also prints in-container --help)
+
+Anything after `--` is forwarded verbatim. Use it for the in-container -e key=value
+encoder options or any flag this wrapper doesn't model explicitly.
+
+EXAMPLES
+  # Default: 4x anime upscale
+  video2x clip.mp4 clip-4x.mp4
+
+  # 4K film via Real-ESRGAN-plus with x264 CRF 17
+  video2x movie.mkv movie-4k.mkv --realesrgan-model realesrgan-plus -s 4 \
+          -c libx264rgb -- -e crf=17 -e preset=veryslow -e tune=film
+
+  # Anime4K v4 mode A+A to 2160p
+  video2x clip.mp4 clip-2160.mp4 -p libplacebo --libplacebo-shader anime4k-v4-a+a \
+          -w 3840 -H 2160
+
+  # 30→120 fps via RIFE
+  video2x clip.mp4 clip-120.mp4 -m 4
+
+  # Pick second 3090
+  video2x clip.mp4 clip-4x.mp4 -d 1
+EOF
+}
+
+POSITIONAL=()
+PASSTHROUGH=0
+while [[ $# -gt 0 ]]; do
+  if [[ $PASSTHROUGH -eq 1 ]]; then
+    EXTRA+=("$1"); shift; continue
+  fi
+  case "$1" in
+    --)                     PASSTHROUGH=1; shift ;;
+    -p|--processor)         PROCESSOR="$2"; shift 2 ;;
+    -s|--scale|--scaling-factor) SCALE="$2"; shift 2 ;;
+    -w|--width)             WIDTH="$2"; shift 2 ;;
+    -H|--height)            HEIGHT="$2"; shift 2 ;;
+    --realesrgan-model)     RE_MODEL="$2"; shift 2 ;;
+    --realcugan-model)      RC_MODEL="$2"; PROCESSOR="realcugan"; shift 2 ;;
+    --rife-model)           RIFE_MODEL="$2"; shift 2 ;;
+    --libplacebo-shader)    SHADER="$2"; PROCESSOR="libplacebo"; shift 2 ;;
+    -m|--multiplier|--frame-rate-mul) INTERP="$2"; PROCESSOR="rife"; shift 2 ;;
+    -d|--device)            DEVICE="$2"; shift 2 ;;
+    -c|--codec)             CODEC="$2"; shift 2 ;;
+    --image)                IMAGE="$2"; shift 2 ;;
+    --profile)              PROFILE="$2"; shift 2 ;;
+    --model)                # shortcut: pick a community model profile and use its realesrgan-plus slot
+                            PROFILE="$2"; RE_MODEL="realesrgan-plus"; PROCESSOR="realesrgan"; shift 2 ;;
+    -l|--list-devices)      DO_LIST=1; shift ;;
+    --pull)                 DO_PULL=1; shift ;;
+    --shell)                DO_SHELL=1; shift ;;
+    --dual-gpu)             DUAL_GPU=1; shift ;;
+    -h|--help)              usage; echo; echo "----- in-container video2x --help -----"; exec podman run --rm "$IMAGE" --help ;;
+    # 0-arg flags forwarded to the in-container video2x
+    -b|--benchmark|-V|--version|--no-progress|--no-copy-streams|--rife-uhd)
+                            EXTRA+=("$1"); shift ;;
+    # any other -flag: forward to container; consume next arg as value if it doesn't look like a flag
+    -*)
+      EXTRA+=("$1")
+      if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then
+        EXTRA+=("$2"); shift 2
+      else
+        shift
+      fi
+      ;;
+    *)                      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+GPU_FLAGS=( --device nvidia.com/gpu=all --security-opt=label=disable )
+
+# Resolve the active model profile (set via --profile or VIDEO2X_PROFILE env).
+# Each profile is built by `v2x-install-models` and contains a complete
+# realesrgan model dir; the wrapper bind-mounts it over the container's.
+PROFILES_ROOT="$HOME/.local/share/video2x/profiles"
+PROFILE="${PROFILE:-${VIDEO2X_PROFILE:-}}"
+MODEL_MOUNTS=()
+if [[ -n "$PROFILE" ]]; then
+  pdir="$PROFILES_ROOT/$PROFILE/realesrgan"
+  if [[ -d "$pdir" ]] && [[ -n "$(ls -A "$pdir" 2>/dev/null)" ]]; then
+    MODEL_MOUNTS+=( -v "$pdir:/usr/share/video2x/models/realesrgan:ro" )
+  else
+    echo "video2x: profile '$PROFILE' not found at $pdir — run v2x-install-models" >&2
+    exit 2
+  fi
+fi
+
+if [[ "$DO_PULL" -eq 1 ]]; then
+  exec podman pull "$IMAGE"
+fi
+
+if [[ "$DO_LIST" -eq 1 ]]; then
+  exec podman run --rm "${GPU_FLAGS[@]}" "$IMAGE" --list-devices
+fi
+
+if [[ "$DO_SHELL" -eq 1 ]]; then
+  exec podman run --rm -it "${GPU_FLAGS[@]}" "${MODEL_MOUNTS[@]}" --entrypoint /bin/bash \
+       -v "$PWD":/host -w /host "$IMAGE"
+fi
+
+if [[ $# -lt 2 ]]; then
+  usage >&2
+  exit 1
+fi
+
+INPUT_RAW="$1"
+OUTPUT_RAW="$2"
+
+[[ -f "$INPUT_RAW" ]] || { echo "video2x: input not found: $INPUT_RAW" >&2; exit 1; }
+
+INPUT_ABS="$(readlink -f -- "$INPUT_RAW")"
+IN_DIR="$(dirname  -- "$INPUT_ABS")"
+IN_BASE="$(basename -- "$INPUT_ABS")"
+
+OUT_DIR_RAW="$(dirname -- "$OUTPUT_RAW")"
+mkdir -p -- "$OUT_DIR_RAW"
+OUT_DIR="$(readlink -f -- "$OUT_DIR_RAW")"
+OUT_BASE="$(basename -- "$OUTPUT_RAW")"
+
+# --- --dual-gpu: split → process two chunks in parallel on -d 0/-d 1 → concat
+if [[ "$DUAL_GPU" -eq 1 && "${V2X_DUAL_INNER:-}" != "1" ]]; then
+  command -v ffmpeg  >/dev/null || { echo "video2x: --dual-gpu needs host ffmpeg"  >&2; exit 1; }
+  command -v ffprobe >/dev/null || { echo "video2x: --dual-gpu needs host ffprobe" >&2; exit 1; }
+
+  inner_args=( -p "$PROCESSOR" )
+  [[ -n "$WIDTH"      ]] && inner_args+=( -w "$WIDTH" )
+  [[ -n "$HEIGHT"     ]] && inner_args+=( -H "$HEIGHT" )
+  [[ -n "$INTERP"     ]] && inner_args+=( -m "$INTERP" )
+  [[ -z "$INTERP" && -z "$WIDTH" && -z "$HEIGHT" ]] && inner_args+=( -s "$SCALE" )
+  [[ -n "$RE_MODEL"   ]] && inner_args+=( --realesrgan-model  "$RE_MODEL" )
+  [[ -n "$RC_MODEL"   ]] && inner_args+=( --realcugan-model   "$RC_MODEL" )
+  [[ -n "$RIFE_MODEL" ]] && inner_args+=( --rife-model        "$RIFE_MODEL" )
+  [[ -n "$SHADER"     ]] && inner_args+=( --libplacebo-shader "$SHADER" )
+  [[ -n "$CODEC"      ]] && inner_args+=( -c "$CODEC" )
+  [[ -n "$PROFILE"    ]] && inner_args+=( --profile "$PROFILE" )
+  [[ -n "$IMAGE"      ]] && inner_args+=( --image   "$IMAGE" )
+
+  STAGE_DIR="$(mktemp -d -p "$OUT_DIR" .v2x-dual.XXXXXX)"
+  trap 'rm -rf "$STAGE_DIR"' EXIT
+
+  duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$INPUT_ABS" 2>/dev/null || true)
+  if [[ -z "$duration" || "$duration" == "N/A" ]]; then
+    echo "video2x: could not probe duration of $INPUT_ABS — falling back to single-GPU" >&2
+    DUAL_GPU=0
+  else
+    mid=$(awk -v d="$duration" 'BEGIN { printf "%.3f", d/2 }')
+    echo "→ [dual-gpu] splitting $IN_BASE at ~${mid}s (duration ${duration}s) into 2 chunks"
+    ffmpeg -nostdin -hide_banner -loglevel warning -y \
+      -i "$INPUT_ABS" -c copy -map 0 \
+      -f segment -segment_time "$mid" -reset_timestamps 1 \
+      "$STAGE_DIR/chunk%03d.mkv"
+
+    shopt -s nullglob
+    chunks=( "$STAGE_DIR"/chunk*.mkv )
+    shopt -u nullglob
+    if [[ ${#chunks[@]} -lt 2 ]]; then
+      echo "video2x: dual-gpu split produced ${#chunks[@]} chunk(s); falling back to single-GPU" >&2
+      DUAL_GPU=0
+    else
+      # Keep only the first two chunks; if ffmpeg produced 3+ (tiny tail), merge tail into chunk 1
+      if [[ ${#chunks[@]} -gt 2 ]]; then
+        echo "  (merging ${#chunks[@]} chunks down to 2 to keep one job per GPU)"
+        listfile="$STAGE_DIR/tail-list.txt"
+        for c in "${chunks[@]:1}"; do printf "file '%s'\n" "$(basename "$c")" >> "$listfile"; done
+        merged="$STAGE_DIR/chunk-tail.mkv"
+        ( cd "$STAGE_DIR" && ffmpeg -nostdin -hide_banner -loglevel warning -y \
+            -f concat -safe 0 -i "$(basename "$listfile")" -c copy "$(basename "$merged")" )
+        for c in "${chunks[@]:1}"; do rm -f "$c"; done
+        mv "$merged" "${chunks[1]}"
+        chunks=( "${chunks[0]}" "${chunks[1]}" )
+      fi
+
+      echo "→ [dual-gpu] processing on GPU 0 + GPU 1 in parallel"
+      pids=()
+      i=0
+      for chunk in "${chunks[@]}"; do
+        out="$STAGE_DIR/$(basename "$chunk" .mkv)-up.mkv"
+        if [[ ${#EXTRA[@]} -gt 0 ]]; then
+          V2X_DUAL_INNER=1 "$0" "${inner_args[@]}" -d "$i" -c "${CODEC:-libx264}" \
+            "$chunk" "$out" -- "${EXTRA[@]}" &
+        else
+          V2X_DUAL_INNER=1 "$0" "${inner_args[@]}" -d "$i" \
+            "$chunk" "$out" &
+        fi
+        pids+=( "$!" )
+        i=$((i + 1))
+      done
+
+      ok=1
+      for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then ok=0; fi
+      done
+      [[ $ok -eq 1 ]] || { echo "video2x: dual-gpu: at least one chunk failed" >&2; exit 1; }
+
+      echo "→ [dual-gpu] concatenating to $OUT_BASE"
+      listfile="$STAGE_DIR/concat-list.txt"
+      : > "$listfile"
+      for chunk in "${chunks[@]}"; do
+        printf "file '%s'\n" "$(basename "$chunk" .mkv)-up.mkv" >> "$listfile"
+      done
+      ( cd "$STAGE_DIR" && ffmpeg -nostdin -hide_banner -loglevel warning -y \
+          -f concat -safe 0 -i "$(basename "$listfile")" -c copy "$OUT_DIR/$OUT_BASE" )
+
+      echo "✓ dual-gpu done: $OUT_DIR/$OUT_BASE"
+      exit 0
+    fi
+  fi
+fi
+
+if [[ "$IN_DIR" == "$OUT_DIR" ]]; then
+  MOUNTS=( -v "$IN_DIR":/host )
+  IN_PATH="/host/$IN_BASE"
+  OUT_PATH="/host/$OUT_BASE"
+else
+  MOUNTS=( -v "$IN_DIR":/in:ro -v "$OUT_DIR":/out )
+  IN_PATH="/in/$IN_BASE"
+  OUT_PATH="/out/$OUT_BASE"
+fi
+
+ARGS=( -i "$IN_PATH" -o "$OUT_PATH" -p "$PROCESSOR" )
+
+if [[ -n "$INTERP" ]]; then
+  ARGS+=( -m "$INTERP" )
+  [[ -n "$RIFE_MODEL" ]] && ARGS+=( --rife-model "$RIFE_MODEL" )
+else
+  case "$PROCESSOR" in
+    realesrgan)
+      [[ -n "$WIDTH"  ]] && ARGS+=( -w "$WIDTH" )
+      [[ -n "$HEIGHT" ]] && ARGS+=( -h "$HEIGHT" )
+      [[ -z "$WIDTH" && -z "$HEIGHT" ]] && ARGS+=( -s "$SCALE" )
+      ARGS+=( --realesrgan-model "$RE_MODEL" )
+      ;;
+    realcugan)
+      [[ -n "$WIDTH"  ]] && ARGS+=( -w "$WIDTH" )
+      [[ -n "$HEIGHT" ]] && ARGS+=( -h "$HEIGHT" )
+      [[ -z "$WIDTH" && -z "$HEIGHT" ]] && ARGS+=( -s "$SCALE" )
+      [[ -n "$RC_MODEL" ]] && ARGS+=( --realcugan-model "$RC_MODEL" )
+      ;;
+    libplacebo)
+      [[ -n "$WIDTH"  ]] && ARGS+=( -w "$WIDTH" )
+      [[ -n "$HEIGHT" ]] && ARGS+=( -h "$HEIGHT" )
+      [[ -n "$SHADER" ]] && ARGS+=( --libplacebo-shader "$SHADER" )
+      ;;
+    rife)
+      ARGS+=( -m "${INTERP:-2}" )
+      [[ -n "$RIFE_MODEL" ]] && ARGS+=( --rife-model "$RIFE_MODEL" )
+      ;;
+  esac
+fi
+
+[[ -n "$DEVICE" ]] && ARGS+=( -d "$DEVICE" )
+[[ -n "$CODEC"  ]] && ARGS+=( -c "$CODEC"  )
+ARGS+=( "${EXTRA[@]}" )
+
+exec podman run --rm -it \
+  "${GPU_FLAGS[@]}" \
+  "${MODEL_MOUNTS[@]}" \
+  "${MOUNTS[@]}" \
+  "$IMAGE" "${ARGS[@]}"

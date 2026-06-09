@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# uav-install-models — install UAV pretrained_models (~10 GB) from Google Drive.
+#
+# Two paths (auto-detected):
+#   1. If `$UAV_MODELS/upscale_a_video.zip` exists — unzip it (user downloaded
+#      via browser, recommended because GD anonymous-quota rate-limits gdown).
+#   2. Otherwise try `gdown` for the file. May fail with "Too many users have
+#      viewed or downloaded this file recently" — in which case the script
+#      prints the manual download URL and exits.
+#
+# Re-run safely; skips if models are already present.
+set -euo pipefail
+
+IMAGE="${UAV_IMAGE:-localhost/uav:latest}"
+MODELS_DIR="${UAV_MODELS:-$HOME/.local/share/uav/models}"
+ZIP_FILE_ID="17-ZqLJ0gNJGqlO0Mu0Hyoi31fLp0dKWY"   # upscale_a_video.zip on GD
+EXPECTED_SUBDIRS=(low_res_scheduler propagator scheduler text_encoder tokenizer unet vae)
+
+mkdir -p "$MODELS_DIR"
+
+target="$MODELS_DIR/upscale_a_video"
+if [[ -d "$target" ]]; then
+  missing=0
+  for sub in "${EXPECTED_SUBDIRS[@]}"; do
+    [[ -d "$target/$sub" ]] || { missing=1; break; }
+  done
+  if [[ $missing -eq 0 ]]; then
+    echo "✓ UAV models already installed at $target"
+    du -sh "$target"
+    exit 0
+  fi
+  echo "models dir exists but is incomplete — re-installing"
+fi
+
+if ! podman image exists "$IMAGE"; then
+  echo "uav-install-models: container image $IMAGE not built yet." >&2
+  echo "Run: podman build -t $IMAGE ~/.local/share/uav/build" >&2
+  exit 1
+fi
+
+zip_path="$MODELS_DIR/upscale_a_video.zip"
+
+# Path 1: local zip already present (user downloaded via browser)
+if [[ -f "$zip_path" ]]; then
+  size=$(stat -c%s "$zip_path")
+  if [[ $size -lt 1000000000 ]]; then
+    echo "uav-install-models: $zip_path is only $((size/1024/1024)) MB; expected ~10 GB." >&2
+    echo "Re-download (probably an interrupted browser transfer)." >&2
+    exit 1
+  fi
+  echo "→ Found $zip_path ($((size/1024/1024/1024)) GB) — unpacking"
+  podman run --rm \
+    --security-opt=label=disable \
+    -v "$MODELS_DIR":/dl \
+    --entrypoint /bin/bash \
+    "$IMAGE" \
+    -c "cd /dl && python -m zipfile -e upscale_a_video.zip . && ls upscale_a_video/ 2>/dev/null || ls"
+else
+  # Path 2: try gdown
+  echo "→ Trying gdown for upscale_a_video.zip from Google Drive (~10 GB)..."
+  if podman run --rm \
+       --security-opt=label=disable \
+       -v "$MODELS_DIR":/dl \
+       --entrypoint /bin/bash \
+       "$IMAGE" \
+       -c "cd /dl && gdown --id $ZIP_FILE_ID && python -m zipfile -e upscale_a_video.zip ."; then
+    :
+  else
+    cat >&2 <<EOF
+
+✗ gdown failed — Google Drive anonymous quota is likely exhausted
+  (happens often on popular public files like this one).
+
+Manual workaround (5 min):
+  1. Open this URL in your browser (signed into Google):
+     https://drive.google.com/file/d/$ZIP_FILE_ID/view
+  2. Click Download (≈10 GB; if Google warns "can't scan", choose Download anyway)
+  3. Move the file to:
+     $zip_path
+  4. Re-run: uav-install-models
+
+Or wait 24 h for the anonymous quota to reset and re-run.
+EOF
+    exit 1
+  fi
+fi
+
+# Verify the unpacked tree
+if [[ ! -d "$target" ]]; then
+  echo "uav-install-models: unzip succeeded but $target is missing." >&2
+  echo "Contents of $MODELS_DIR:" >&2
+  ls -la "$MODELS_DIR" >&2
+  exit 1
+fi
+
+missing=0
+for sub in "${EXPECTED_SUBDIRS[@]}"; do
+  if [[ ! -d "$target/$sub" ]]; then
+    echo "✗ missing subdir: $sub" >&2
+    missing=1
+  fi
+done
+[[ $missing -eq 0 ]] || exit 1
+
+echo
+echo "✓ Models installed at $target"
+du -sh "$target"
+echo
+echo "Sub-trees:"
+for sub in "${EXPECTED_SUBDIRS[@]}"; do
+  printf "  ✓ %s  (%s)\n" "$sub" "$(du -sh "$target/$sub" | cut -f1)"
+done
+
+# Optional cleanup: remove the zip if everything unpacked
+if [[ -f "$zip_path" ]]; then
+  echo
+  read -rp "Delete the 10 GB zip ($zip_path)? [y/N] " yn
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    rm -f "$zip_path"
+    echo "removed"
+  fi
+fi

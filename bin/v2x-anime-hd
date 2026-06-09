@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# v2x-anime-hd — anime preset using HFA2K (modern, sharper than animevideov3)
+# Uses the `anime-stills` profile: realesrgan-plus slot → HFA2K. Best for
+# recent high-quality anime / stills. May flicker slightly on fast action —
+# fall back to `v2x-anime` (realesr-animevideov3) in that case.
+# Setup once: v2x-install-models
+PROFILE_DIR="$HOME/.local/share/video2x/profiles/anime-stills/realesrgan"
+PROFILE_ARGS=( --realesrgan-model realesr-animevideov3 )   # safe fallback
+if [[ -d "$PROFILE_DIR" ]]; then
+  PROFILE_ARGS=( --profile anime-stills --realesrgan-model realesrgan-plus )
+fi
+exec video2x \
+  "${PROFILE_ARGS[@]}" \
+  -s 4 \
+  -c libx264 \
+  "$@" \
+  -- --pix-fmt yuv420p -e crf=17 -e preset=slow -e tune=animation

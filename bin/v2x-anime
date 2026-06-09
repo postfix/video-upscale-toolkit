@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# v2x-anime — anime / cartoon preset
+# Defaults to realesr-animevideov3 (temporal-aware model purpose-built for anime
+# *video*; community alternative `hfa2k` is sharper but trained on stills and
+# can flicker frame-to-frame). Use `v2x-anime-hd` for the hfa2k variant.
+exec video2x \
+  --realesrgan-model realesr-animevideov3 \
+  -s 4 \
+  -c libx264 \
+  "$@" \
+  -- --pix-fmt yuv420p -e crf=17 -e preset=slow -e tune=animation

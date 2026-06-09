@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# uav — podman wrapper for Upscale-A-Video (diffusion video super-resolution).
+# Single-card inference. 24 GB-safe defaults via tiling + LLaVA skip.
+set -euo pipefail
+
+IMAGE="${UAV_IMAGE:-localhost/uav:latest}"
+MODELS_DIR="${UAV_MODELS:-$HOME/.local/share/uav/models}"
+CACHE_DIR="${UAV_CACHE:-$HOME/.cache/uav}"
+
+usage() {
+  cat <<'EOF'
+uav — podman wrapper for Upscale-A-Video (diffusion video super-resolution)
+
+USAGE
+  uav INPUT OUTPUT_DIR [OPTIONS] [-- raw UAV flags...]
+  uav --shell                  # interactive shell in the container
+
+OPTIONS
+      --deep                   higher quality: more inference steps, no tiling (needs ~30 GB VRAM)
+      --device IDX             Vulkan/CUDA device index (default: 0; or "0,1" for both cards)
+      --no-tile                disable tiling (faster but more VRAM)
+      --use-video-vae          use the lighter video VAE (vs. 3D VAE)
+      --color-fix MODE         None | AdaIn | Wavelet (default: AdaIn)
+  -n  --noise-level N          default 120
+  -g  --guidance-scale N       default 6
+  -s  --inference-steps N      default 30 (default mode), 50 (--deep)
+      --prompt TEXT            positive prompt (default: "best quality, extremely detailed")
+      --neg-prompt TEXT        negative prompt (default: "blur, worst quality")
+  -h  --help
+
+DEFAULTS (works on dual 24 GB 3090s after the BF16/multi-GPU patches):
+  --no_llava                   skip LLaVA caption model (~13 GB VRAM)
+  --perform_tile --tile_size 128   (256 OOMs even with multi-GPU)
+  --use-video-vae                  (auto-set in default mode)
+  --color_fix AdaIn
+  -n 120 -g 6 -s 30
+The container is built with UNet on cuda:0 and VAE on cuda:1, so the visible
+GPU count must be >= 2. --device 0 falls back to single-GPU mode but may OOM.
+
+EXAMPLES
+  uav clip.mp4 ./out
+  uav clip.mp4 ./out --deep                                # max quality
+  uav clip.mp4 ./out --device 1                            # second 3090
+  uav clip.mp4 ./out --prompt "vintage 1980s home video, film grain"
+  uav clip.mp4 ./out -- -n 150 -g 8 -s 50 --color_fix Wavelet
+EOF
+}
+
+DEEP=0
+NO_TILE=0
+DEVICE=""
+USE_VIDEO_VAE=0
+COLOR_FIX=""
+N_LEVEL=""
+G_SCALE=""
+STEPS=""
+PROMPT=""
+NEG_PROMPT=""
+DO_SHELL=0
+EXTRA=()
+POSITIONAL=()
+PASSTHROUGH=0
+
+while [[ $# -gt 0 ]]; do
+  if [[ $PASSTHROUGH -eq 1 ]]; then
+    EXTRA+=("$1"); shift; continue
+  fi
+  case "$1" in
+    -h|--help)              usage; exit 0 ;;
+    --shell)                DO_SHELL=1; shift ;;
+    --deep)                 DEEP=1; shift ;;
+    --no-tile)              NO_TILE=1; shift ;;
+    --use-video-vae)        USE_VIDEO_VAE=1; shift ;;
+    --device)               DEVICE="$2"; shift 2 ;;
+    --color-fix)            COLOR_FIX="$2"; shift 2 ;;
+    -n|--noise-level)       N_LEVEL="$2"; shift 2 ;;
+    -g|--guidance-scale)    G_SCALE="$2"; shift 2 ;;
+    -s|--inference-steps)   STEPS="$2"; shift 2 ;;
+    --prompt)               PROMPT="$2"; shift 2 ;;
+    --neg-prompt)           NEG_PROMPT="$2"; shift 2 ;;
+    --)                     PASSTHROUGH=1; shift ;;
+    -*)                     EXTRA+=("$1"); shift ;;
+    *)                      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+if [[ $DO_SHELL -eq 1 ]]; then
+  exec podman run --rm -it \
+    --device nvidia.com/gpu=all --security-opt=label=disable \
+    -v "$MODELS_DIR/upscale_a_video":/opt/Upscale-A-Video/pretrained_models/upscale_a_video:ro \
+    -v "$CACHE_DIR":/cache \
+    --entrypoint /bin/bash \
+    "$IMAGE"
+fi
+
+if [[ $# -lt 2 ]]; then
+  usage >&2; exit 1
+fi
+
+INPUT="$1"; OUTPUT="$2"; shift 2
+
+INPUT_ABS="$(readlink -f -- "$INPUT")"
+[[ -e "$INPUT_ABS" ]] || { echo "uav: input not found: $INPUT_ABS" >&2; exit 1; }
+IN_DIR="$(dirname  -- "$INPUT_ABS")"
+IN_BASE="$(basename -- "$INPUT_ABS")"
+
+mkdir -p -- "$OUTPUT"
+OUT_ABS="$(readlink -f -- "$OUTPUT")"
+
+[[ -d "$MODELS_DIR/upscale_a_video" ]] || {
+  echo "uav: models not installed. Run: uav-install-models" >&2
+  exit 1
+}
+[[ -d "$MODELS_DIR/upscale_a_video/unet" ]] || {
+  echo "uav: model tree at $MODELS_DIR/upscale_a_video looks incomplete" >&2
+  exit 1
+}
+
+mkdir -p "$CACHE_DIR"
+
+# Build UAV argv
+ARGS=(
+  -i "/workspace/input/$IN_BASE"
+  -o "/workspace/output"
+  --no_llava
+  --color_fix "${COLOR_FIX:-AdaIn}"
+  -n "${N_LEVEL:-120}"
+  -g "${G_SCALE:-6}"
+)
+
+if [[ $DEEP -eq 1 ]]; then
+  ARGS+=( -s "${STEPS:-50}" )
+  [[ $USE_VIDEO_VAE -eq 1 ]] && ARGS+=( --use_video_vae )
+else
+  ARGS+=( -s "${STEPS:-30}" )
+  # tile_size=128 is the smallest that works without UAV's tile-composition
+  # shape bug (64 errors at the end-of-row tiles). 256 OOMs at decode even
+  # with multi-GPU + bf16 + short_seq=1.
+  [[ $NO_TILE -eq 0 ]] && ARGS+=( --perform_tile --tile_size 128 )
+  # --use_video_vae picks the lighter video VAE (vae_video, slices temporally
+  # via the short_seq=1 patch) instead of the 3D VAE which needs 65 GB.
+  ARGS+=( --use_video_vae )
+fi
+[[ -n "$PROMPT"     ]] && ARGS+=( --a_prompt "$PROMPT" )
+[[ -n "$NEG_PROMPT" ]] && ARGS+=( --n_prompt "$NEG_PROMPT" )
+
+ARGS+=( "${EXTRA[@]}" )
+
+# CUDA device pinning
+ENV_FLAGS=()
+if [[ -n "$DEVICE" ]]; then
+  ENV_FLAGS+=( -e "CUDA_VISIBLE_DEVICES=$DEVICE" )
+fi
+
+echo "→ uav: $IN_BASE → $OUT_ABS"
+[[ $DEEP -eq 1 ]] && echo "  (--deep: untiled, 50 steps)"
+
+exec podman run --rm -it \
+  --device nvidia.com/gpu=all --security-opt=label=disable \
+  "${ENV_FLAGS[@]}" \
+  -v "$MODELS_DIR/upscale_a_video":/opt/Upscale-A-Video/pretrained_models/upscale_a_video:ro \
+  -v "$IN_DIR":/workspace/input:ro \
+  -v "$OUT_ABS":/workspace/output \
+  -v "$CACHE_DIR":/cache \
+  "$IMAGE" \
+  "${ARGS[@]}"

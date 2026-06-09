@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# v2x-home — home / live-action video preset
+# Uses the `live-action` profile: realesrgan-plus slot → 4x_NMKD-Siax_200k
+# (denoising upscaler purpose-built for compressed/noisy sources). Falls
+# back to bundled realesrgan-plus if the profile hasn't been installed.
+# Setup once: v2x-install-models
+PROFILE_DIR="$HOME/.local/share/video2x/profiles/live-action/realesrgan"
+PROFILE_ARGS=()
+[[ -d "$PROFILE_DIR" ]] && PROFILE_ARGS=( --profile live-action )
+exec video2x \
+  "${PROFILE_ARGS[@]}" \
+  --realesrgan-model realesrgan-plus \
+  -s 4 \
+  -c libx264 \
+  "$@" \
+  -- --pix-fmt yuv420p -e crf=18 -e preset=slow -e tune=film

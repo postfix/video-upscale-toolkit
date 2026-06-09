@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# v2x-install-models — install community NCNN upscaling models for Video2X.
+#
+# Video2X's CLI hardcodes the list of accepted --realesrgan-model names
+# (realesrgan-plus, realesrgan-plus-anime, realesr-animevideov3), so community
+# models can't be selected by name directly. Instead we build per-purpose
+# *profiles* — each profile is a complete model directory where the slot files
+# (realesrgan-plus-x4.param/bin etc.) point to the community weights that suit
+# that profile. The main `video2x` wrapper bind-mounts a profile dir over
+# /usr/share/video2x/models/realesrgan inside the container.
+#
+# Profiles produced:
+#   default       — bundled models only, no overrides
+#   live-action   — realesrgan-plus slot = 4x_NMKD-Siax_200k (compressed sources)
+#   nsfw          — realesrgan-plus slot = foolhardy Remacri (skin texture)
+#   anime-stills  — realesrgan-plus slot = 4xHFA2k (sharp modern anime)
+#
+# Re-run any time. Existing files are skipped.
+set -euo pipefail
+
+IMAGE="${VIDEO2X_IMAGE:-ghcr.io/k4yt3x/video2x:6.4.0}"
+BASE="$HOME/.local/share/video2x"
+COMMUNITY="$BASE/community/realesrgan"
+PROFILES="$BASE/profiles"
+mkdir -p "$COMMUNITY" "$PROFILES"
+
+trim() { local s="${1#"${1%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
+
+declare -a COMMUNITY_MODELS=(
+  "remacri        | upscayl | remacri-4x         | foolhardy Remacri — live-action / NSFW favourite, preserves skin"
+  "nmkd-siax      | custom  | 4x_NMKD-Siax_200k  | NMKD Siax — denoise upscaler for compressed sources"
+  "ultrasharp     | upscayl | ultrasharp-4x      | NMKD UltraSharp — very sharp, line art / hard edges"
+  "high-fidelity  | upscayl | high-fidelity-4x   | High Fidelity — detail-preserving for clean sources"
+  "hfa2k          | custom  | 4xHFA2k            | HFA2K — modern anime model"
+  "lsdir-plus     | custom  | 4xLSDIRplusC       | LSDIR+C — modern general-purpose"
+)
+
+url_for() {
+  case "$1" in
+    upscayl) echo "https://raw.githubusercontent.com/upscayl/upscayl/main/resources/models" ;;
+    custom)  echo "https://raw.githubusercontent.com/upscayl/custom-models/main/models" ;;
+  esac
+}
+
+# --- 1. Cache bundled models from container into community/.bundled/ ---
+BUNDLED="$BASE/community/bundled"
+if [[ ! -f "$BUNDLED/realesrgan-plus-x4.param" ]]; then
+  echo "→ Caching bundled models from $IMAGE"
+  mkdir -p "$BUNDLED"
+  cid=$(podman create "$IMAGE")
+  trap 'podman rm "$cid" >/dev/null 2>&1 || true' EXIT
+  podman cp "$cid:/usr/share/video2x/models/realesrgan/." "$BUNDLED/"
+  podman rm "$cid" >/dev/null
+  trap - EXIT
+fi
+
+# --- 2. Download community models ---
+echo "→ Downloading community models to $COMMUNITY"
+for spec in "${COMMUNITY_MODELS[@]}"; do
+  IFS='|' read -r pretty src base desc <<<"$spec"
+  pretty=$(trim "$pretty"); src=$(trim "$src"); base=$(trim "$base")
+  url_base=$(url_for "$src")
+  for ext in param bin; do
+    out="$COMMUNITY/${pretty}-x4.${ext}"
+    if [[ -f "$out" && -s "$out" ]]; then
+      printf "  ✓ %-30s (cached)\n" "${pretty}-x4.${ext}"
+      continue
+    fi
+    printf "  ↓ %-30s\n" "${pretty}-x4.${ext}"
+    curl -fsSL --retry 3 -o "$out.tmp" "$url_base/${base}.${ext}"
+    mv "$out.tmp" "$out"
+  done
+done
+
+# --- 3. Build profile dirs ---
+# Each profile = full set of files. realesrgan-plus slot is swapped to the
+# profile's chosen community model; other slots stay as bundled originals.
+#  profile_name : community_model_for_realesrgan-plus_slot
+declare -A PROFILE_PLUS=(
+  [default]=""               # no override
+  [live-action]=nmkd-siax
+  [nsfw]=remacri
+  [anime-stills]=hfa2k
+  # General-purpose model profiles, used by `video2x --model NAME`:
+  [ultrasharp]=ultrasharp
+  [high-fidelity]=high-fidelity
+  [lsdir-plus]=lsdir-plus
+)
+
+echo
+echo "→ Building profile dirs in $PROFILES"
+for profile in "${!PROFILE_PLUS[@]}"; do
+  pd="$PROFILES/$profile/realesrgan"
+  mkdir -p "$pd"
+  # populate with bundled originals (use ln -f for hardlinks to save disk)
+  for src in "$BUNDLED"/*; do
+    ln -f "$src" "$pd/$(basename "$src")"
+  done
+  # swap the realesrgan-plus slot if profile specifies a community model
+  swap="${PROFILE_PLUS[$profile]}"
+  if [[ -n "$swap" ]]; then
+    for ext in param bin; do
+      src="$COMMUNITY/${swap}-x4.${ext}"
+      if [[ ! -f "$src" ]]; then
+        echo "  ! $profile: community model $swap missing $ext, skipping swap" >&2
+        continue
+      fi
+      ln -f "$src" "$pd/realesrgan-plus-x4.${ext}"
+    done
+    printf "  ✓ %-15s realesrgan-plus ← %s\n" "$profile" "$swap"
+  else
+    printf "  ✓ %-15s (bundled, no overrides)\n" "$profile"
+  fi
+done
+
+echo
+echo "Done. Profiles available:"
+ls -1 "$PROFILES" | sed 's/^/    /'
+echo
+echo "Use directly:  video2x in.mp4 out.mp4 --profile live-action --realesrgan-model realesrgan-plus -s 4"
+echo "Or via preset: v2x-home / v2x-nsfw / v2x-anime / v2x-anime-hd"
