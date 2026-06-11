@@ -70,6 +70,40 @@ uav unknown.mp4 ./out \
   --neg-prompt "blur, compression artifacts, banding, plastic, oversharpened, AI hallucination"
 ```
 
+## Faces and skin: UAV is conservative by default
+
+UAV restores backgrounds, textures, fabric, and architectural detail
+aggressively. **It is deliberately conservative on human faces, bodies, and
+skin** — most diffusion video upscalers are. The model treats faces as a
+strong prior to avoid identity drift and uncanny-valley artifacts. With
+the default `-n 120 -g 6 --prompt "best quality, extremely detailed"`,
+expect background detail to jump a tier while faces look essentially
+unchanged from the source.
+
+**To push UAV harder on skin/face regions**, all three dials matter:
+
+```bash
+uav clip.mp4 ./out -n 160 -g 8 -s 30 \
+  --prompt "high resolution skin texture, sharp facial features, visible pores, detailed eyes, natural skin tones, fine hair detail" \
+  --neg-prompt "plastic skin, waxy texture, smoothed face, blurry features, AI hallucination, distorted anatomy"
+```
+
+- `-n 160` (vs default 120) tells the scheduler to alter the source more
+- `-g 8` (vs default 6) makes the prompt drive harder over the source prior
+- Explicit face/skin tokens in the prompt are the only way the model knows
+  to recover those regions specifically
+
+Even tuned this way UAV will not match a face-specialised model. **For
+serious face restoration on this hardware, use a two-pass workflow:**
+
+1. UAV pass for overall texture/background (preserves identity)
+2. **GFPGAN or CodeFormer** as a second pass to enhance face regions
+
+GFPGAN/CodeFormer are feed-forward (CNN), not diffusion — they finish a
+38 s clip in ~30 s on a 3090, vs UAV's many hours. They're purpose-built
+for face super-resolution and don't have UAV's identity-preserving bias.
+Not yet wrapped in this toolkit — track issue for a `v2x-face` preset.
+
 ## Tips
 
 - **Be specific about era.** "1980s home video" produces noticeably more

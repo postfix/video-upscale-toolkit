@@ -77,6 +77,29 @@ RUN sed -i \
     's|^        short_seq = 3$|        short_seq = 1  # PATCH: shrink VAE temporal attn buffer for 24 GB GPUs|' \
     /opt/Upscale-A-Video/models_video/pipeline_upscale_a_video.py && \
     grep -q "PATCH: shrink VAE temporal" /opt/Upscale-A-Video/models_video/pipeline_upscale_a_video.py && \
+    # PATCH #6: enable xformers memory-efficient attention. xformers 0.0.20
+    # ships with the image and the temporal/spatial modules check for the
+    # `_use_memory_efficient_attention_xformers` flag, but the inference
+    # script never calls pipeline.enable_xformers_memory_efficient_attention()
+    # so the flag stays False everywhere. Costs nothing, saves a few GiB of
+    # attention buffers per forward pass. Inject right after multi_gpu_setup.
+    sed -i \
+    's|^    from multi_gpu_setup import setup_multi_gpu; pipeline = setup_multi_gpu(pipeline)$|&\n    pipeline.enable_xformers_memory_efficient_attention()  # PATCH: cut attention VRAM (xformers 0.0.20)|' \
+    /opt/Upscale-A-Video/inference_upscale_a_video.py && \
+    grep -q "PATCH: cut attention VRAM" /opt/Upscale-A-Video/inference_upscale_a_video.py && \
+    # PATCH #7: remove the silent auto-enable of tiling at >=384^2 input.
+    # The upstream guard `if h * w >= 384*384: args.perform_tile = True`
+    # overrides the user's --perform_tile False (or omission), forcing 5x4
+    # tile loops at 480p and consequently a 20x denoise pass count per
+    # chunk. With the guard removed, the wrapper-passed --tile_size honours
+    # the user's intent (tile_size > input dim = no tiling, big enough
+    # tile_size = fewer-but-bigger tile passes). Memory may not actually
+    # fit untiled on a 24 GB card at 480p — that's the wrapper's job to
+    # navigate; this patch just makes the flag honest.
+    sed -i \
+    '/^        # For large resolution$/{N;s|^        # For large resolution\n        if h \* w >= 384\*384:|        # PATCH: auto-tile guard removed — wrapper picks tile_size deliberately\n        if False and h * w >= 384*384:|}' \
+    /opt/Upscale-A-Video/inference_upscale_a_video.py && \
+    grep -q "auto-tile guard removed" /opt/Upscale-A-Video/inference_upscale_a_video.py && \
     # PATCH #5: replace torchvision.io.read_video (PyAV+swscale "EAGAIN" on
     # real-world videos) with cv2.VideoCapture. Decord — the other obvious
     # alternative — segfaults on get_batch in this container env. cv2 is the

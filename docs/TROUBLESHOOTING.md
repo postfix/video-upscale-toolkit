@@ -148,6 +148,61 @@ Single-card UAV does not fit in 24 GB. Use dual-3090 mode (the default).
 
 ---
 
+## UAV: OOM trying to allocate tens of GiB *before* the first decode
+
+**Symptom**
+
+```
+[multi_gpu_setup] UNet/text_encoder → cuda:0, VAE → cuda:1
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 63.45 GiB
+  (GPU 0; 23.56 GiB total capacity; 13.10 GiB already allocated; ...
+```
+
+Allocation in the tens of GiB, on `cuda:0`, with no `Decoding: N/M` line
+ever printed. The bigger the input clip, the bigger the failed allocation.
+
+**Root cause**
+
+`inference_upscale_a_video.py` (~line 217) pre-allocates the *entire*
+upscaled output as one float32 tensor on `cuda:0` before the decode loop
+starts:
+
+```python
+upscaled_video = vframes.new_zeros(output_shape)   # shape (1, 3, T, 4H, 4W)
+```
+
+For 4× upscale that's `T × 3 × 4H × 4W × 4 bytes` = `192 × W × H × T`.
+A 640×480 @ 30 fps clip works out to ~1.69 GiB **per second** of source —
+so a 38 s clip needs 64 GiB on a single card and there's no way to fit it.
+This is *separate* from the tile-decode OOM above: it fires before the
+VAE ever runs, and tiling/`short_seq` don't help (they affect the decoder
+buffer, not the output buffer).
+
+**Fix (default in the wrapper)**
+
+The `uav` wrapper splits the input into chunks small enough that each
+chunk's output tensor fits a 10 GiB budget, runs UAV per chunk, and concats
+the results losslessly. This is the default — `--chunk auto` — so most
+users never see this OOM in the first place.
+
+```bash
+uav clip.mp4 ./out                # auto-chunk (default), 10 GiB output budget
+uav clip.mp4 ./out --chunk 8      # force 8-second chunks
+uav clip.mp4 ./out --no-chunk     # legacy single-shot; OOMs for clips > ~6 s @ 480p
+
+UAV_OUTPUT_BUDGET_BYTES=$((6*1024**3)) uav clip.mp4 ./out   # tighter 6 GiB budget
+```
+
+Staging dir lives at `~/.cache/uav/chunks/<basename>.<size-mtime>.c<sec>s/`
+and is *kept across runs* so a Ctrl-C or mid-chunk failure resumes from the
+last completed chunk on the next invocation. Pass `--clean-chunks` to delete
+it after a successful concat.
+
+The math behind the auto-chunk picker is in `docs/UAV-NOTES.md`
+("Chunking" section).
+
+---
+
 ## Video2X: `--realesrgan-model X is invalid`
 
 **Symptom**

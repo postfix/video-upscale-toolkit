@@ -7,10 +7,34 @@ NVIDIA GPUs** (e.g. dual RTX 3090 / 4090). Two engines, one wrapper style:
   (Real-ESRGAN, Real-CUGAN, RIFE, Anime4K via libplacebo). Real-time-ish on
   a 3090. Used for the bulk of work.
 - **Upscale-A-Video** (custom-built) — diffusion-based super-resolution
-  ([sczhou/Upscale-A-Video][uav]). 10–30× slower but much better on heavily
-  degraded sources. Patched to fit in dual-24 GB.
+  ([sczhou/Upscale-A-Video][uav]). Much better on heavily degraded
+  backgrounds/textures but **~1000× slower per output frame** than v2x on
+  this hardware. Use for ≤2 s hero shots, not long clips.
 
 [uav]: https://github.com/sczhou/Upscale-A-Video
+
+## Performance on dual 3090s — measured, not estimated
+
+| Engine | Per 1 s of 480p input → 4× upscale | 38 s clip |
+|---|---|---|
+| `v2x-nsfw` (RealESRGAN+Remacri) | ~5-10 s | ~5-10 min |
+| `v2x-home` (NMKD-Siax) | ~5-10 s | ~5-10 min |
+| `uav` (tile-128, sharded UNet, all 7 patches, s=15 draft) | **68 min** | **~36-44 h** |
+| `uav` (full quality, s=30) | ~2 h | ~3+ days |
+
+UAV's slowness is structural to running a model designed for A100-class
+memory on a 24 GB card — it's forced into a 20-pass tile loop that the
+model was never designed to use. See [`docs/UAV-NOTES.md`](docs/UAV-NOTES.md)
+for the seven memory patches and the full cost breakdown.
+
+**Where UAV shines, where it doesn't.** UAV restores backgrounds, textures,
+fabric, foliage, and architecture aggressively. It is **deliberately
+conservative on human faces, bodies, and skin** to preserve identity (a
+known characteristic of diffusion video upscalers). To push it harder on
+skin/faces, raise `-n` to ~160 and `-g` to ~8 with an explicit
+face/skin prompt — see [`docs/PROMPTS.md`](docs/PROMPTS.md) for the recipe.
+For serious face restoration, use UAV for overall texture + a second pass
+with GFPGAN or CodeFormer (feed-forward, ~30 s for a 38 s clip).
 
 ## What's in here
 

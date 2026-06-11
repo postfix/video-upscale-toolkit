@@ -8,47 +8,77 @@ shaders) will smear faces and skin texture — avoid them.
 
 ## 🐢 Hero-clip upscaling — `uav` (Upscale-A-Video)
 
-For 5–60 second clips where you want maximum quality. UAV is a diffusion-based
-video super-resolution model (PyTorch + CUDA). On **dual 24 GB cards** it runs
-with the patches baked into our container (multi-GPU split + BF16 VAE +
-short_seq=1) — about ~30 s/tile-of-128px on a 3090 pair.
+**TL;DR: use UAV only for ≤2 s clips at ≤320p. For anything longer or larger,
+use `v2x-*` instead — UAV is 100× slower per pixel on this hardware.**
+
+UAV is a diffusion-based video super-resolution model. The model was designed
+for A100-class memory (≥40 GB) and was never expected to be tiled. On dual
+24 GB 3090s we're forced into a 5×4 = 20-pass tile loop at 480p that costs
+~20× more compute than the model's intended single-pass mode (see
+`UAV-NOTES.md` for the math). The tile loop is **not** a bug we can patch
+away — there isn't enough VRAM headroom for the single-pass mode at 480p,
+even with xformers + bf16 VAE + short_seq=1.
 
 ```bash
 # one-time setup
 podman build -t localhost/uav:latest ~/.local/share/uav/build      # ~10 GB image
 uav-install-models                                                  # ~10 GB models from Google Drive
 
-# usage
-uav clip.mp4 ./out                                                  # multi-GPU defaults, tile=128, bf16
-uav clip.mp4 ./out --prompt "vintage 1980s home video, film grain"  # guide the diffusion
-uav clip.mp4 ./out -- -n 100 -g 5 -s 25                             # gentler / faster
+# usage — short clips at small resolutions ONLY
+uav 320p-clip.mp4 ./out --no-chunk --no-tile -s 15                  # ~3.5 min per second of 240p
 uav --shell                                                         # debug inside the container
 ```
 
 ### Patches baked into the container
 
-UAV out of the box does **not** fit in 24 GB. Our Dockerfile applies four
+UAV out of the box does **not** fit in 24 GB. Our Dockerfile applies seven
 patches; you don't need to think about them but knowing they're there helps
 when debugging:
 
-| Patch | What it does | Why |
-|---|---|---|
-| `multi_gpu_setup.py` | UNet+text_encoder → `cuda:0`, VAE → `cuda:1` | Splits the ~32 GB peak across two cards |
-| VAE → BF16 | Add `.to(dtype=torch.bfloat16)` after the VAE load | UAV's "fp16 overflows" comment is true; bf16 has fp32 range + fp16 memory |
-| Skip FP32 cast | Comment out `self.vae.to(dtype=torch.float32)` in pipeline | Original cast doubled VAE memory; with bf16 no longer needed |
-| `short_seq = 1` | One frame per VAE decode chunk instead of 3 | Temporal cross-attention is T² — cuts that buffer 9× |
+| # | Patch | What it does | Why |
+|---|---|---|---|
+| 1 | `multi_gpu_setup.py` | UNet+text_encoder → `cuda:0`, VAE → `cuda:1` | Splits the ~32 GB peak across two cards |
+| 2 | VAE → BF16 | Add `.to(dtype=torch.bfloat16)` after the VAE load | UAV's "fp16 overflows" comment is true; bf16 has fp32 range + fp16 memory |
+| 3 | Skip FP32 cast | Comment out `self.vae.to(dtype=torch.float32)` in pipeline | Original cast doubled VAE memory; with bf16 no longer needed |
+| 4 | `short_seq = 1` | One frame per VAE decode chunk instead of 3 | Temporal cross-attention is T² — cuts that buffer 9× |
+| 5 | cv2 reader | Replace `torchvision.io.read_video` with `cv2.VideoCapture` | torchvision → PyAV → swscale fails EAGAIN on many inputs |
+| 6 | Enable xformers | Inject `pipeline.enable_xformers_memory_efficient_attention()` after multi-GPU setup | Upstream ships xformers 0.0.20 but never calls the enable hook — saves a few GiB of attention buffers |
+| 7 | Remove auto-tile guard | `if h*w >= 384*384: args.perform_tile = True` → `if False and ...` | Upstream silently overrode `--no-tile` for any input ≥ 384²; with this gone, `--tile_size` is honest |
 
-### Reality check
+### Reality check (measured, not extrapolated)
 
-- **5 s of 480p source ≈ 8–15 min** on dual 3090s (tile_size=128, 30 steps)
-- **60 s of 480p ≈ 1.5–3 h**
-- Quality is genuinely better than Real-ESRGAN for soft/old footage, but
-  diffusion **can hallucinate detail** — keep the source if you want truth
-- The bf16 VAE drops a tiny bit of decode fidelity vs the original fp32 cast;
-  not visible side-by-side on most content
+- **1 s of 240×240, untiled, s=15: 3.5 min** — the only config that's actually fast
+- **1 s of 480p, untiled, s=15: OOM at ~21 GiB before step 1** — does not fit, even with xformers + sharded UNet
+- **1 s of 480p, tile-128, s=15, sharded UNet (all 7 patches): 68 min** ✓ measured end-to-end
+- **38 s of 480p extrapolation: ~36-44 h** (browser-contended) / ~28-30 h (exclusive GPU)
 
-When the per-second cost matters, `v2x-oldnsfw --deep --dual-gpu` is still
-~10× faster and often "good enough". Reach for `uav` for short prized clips.
+For anything longer than a couple of seconds, **RealESRGAN via `v2x-*` is 100×
+faster** with quality that's usually good enough. UAV is the wrong tool for
+arbitrary footage on this hardware — it's a paper demo. Keep it around for
+short hero shots at small resolutions; otherwise reach for v2x.
+
+### Where UAV shines, where it doesn't
+
+UAV restores **backgrounds, textures, fabrics, architecture, foliage,
+debris** aggressively. It is **deliberately conservative on human faces,
+bodies, and skin** — diffusion video models keep a strong source prior on
+human regions to avoid identity drift and uncanny artifacts. With default
+settings (`-n 120 -g 6`) expect background detail to jump a tier while
+faces look essentially unchanged.
+
+To push UAV harder on skin/faces, use explicit prompt + stronger dials:
+
+```bash
+uav clip.mp4 ./out -n 160 -g 8 -s 30 \
+  --prompt "high resolution skin texture, sharp facial features, visible pores, detailed eyes, natural skin tones" \
+  --neg-prompt "plastic skin, waxy texture, smoothed face, AI hallucination, distorted anatomy"
+```
+
+Even tuned, **UAV will not match a face-specialised model**. The right
+workflow for serious face/skin restoration is two passes: UAV for overall
+texture, then **GFPGAN or CodeFormer** for the face regions (feed-forward,
+finishes a 38 s clip in ~30 s). See `docs/PROMPTS.md` for the full prompt
+recipe and the GFPGAN/CodeFormer integration note.
 
 ---
 

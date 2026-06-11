@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # uav — podman wrapper for Upscale-A-Video (diffusion video super-resolution).
-# Single-card inference. 24 GB-safe defaults via tiling + LLaVA skip.
+# Dual-3090 inference. 24 GB-safe via container patches (bf16 VAE, multi-GPU
+# split, short_seq=1, cv2 reader) + wrapper-level input chunking.
 set -euo pipefail
 
 IMAGE="${UAV_IMAGE:-localhost/uav:latest}"
 MODELS_DIR="${UAV_MODELS:-$HOME/.local/share/uav/models}"
 CACHE_DIR="${UAV_CACHE:-$HOME/.cache/uav}"
+
+# UAV pre-allocates the full upscaled output as a float32 tensor on cuda:0
+# (see inference_upscale_a_video.py line ~217: vframes.new_zeros(output_shape)).
+# For 4× upscale that's 16 × 4 = 64 bytes per input pixel × total frames. We
+# keep that under ~10 GiB so the UNet (~13 GiB resident) and the buffer both
+# fit on a 24 GiB card. Tune via UAV_OUTPUT_BUDGET_BYTES.
+UAV_OUTPUT_BUDGET_BYTES="${UAV_OUTPUT_BUDGET_BYTES:-10737418240}"   # 10 GiB
 
 usage() {
   cat <<'EOF'
@@ -23,6 +31,10 @@ OPTIONS
       --color-fix MODE         None | AdaIn | Wavelet (default: AdaIn)
       --no-retag               skip the colorspace-tag pre-check (advanced; see docs/TROUBLESHOOTING.md)
       --retag                  force re-tag even if metadata looks fine
+      --chunk SEC|auto|off     split input into SEC-second chunks (default: auto)
+      --no-chunk               shorthand for --chunk off
+      --clean-chunks           remove the per-chunk staging directory on success
+                               (default: keep, so failed/aborted runs can resume)
   -n  --noise-level N          default 120
   -g  --guidance-scale N       default 6
   -s  --inference-steps N      default 30 (default mode), 50 (--deep)
@@ -30,7 +42,7 @@ OPTIONS
       --neg-prompt TEXT        negative prompt (default: "blur, worst quality")
   -h  --help
 
-DEFAULTS (works on dual 24 GB 3090s after the BF16/multi-GPU patches):
+DEFAULTS (works on dual 24 GB 3090s after the BF16/multi-GPU/cv2 patches):
   --no_llava                   skip LLaVA caption model (~13 GB VRAM)
   --perform_tile --tile_size 128   (256 OOMs even with multi-GPU)
   --use-video-vae                  (auto-set in default mode)
@@ -39,10 +51,19 @@ DEFAULTS (works on dual 24 GB 3090s after the BF16/multi-GPU patches):
 The container is built with UNet on cuda:0 and VAE on cuda:1, so the visible
 GPU count must be >= 2. --device 0 falls back to single-GPU mode but may OOM.
 
+CHUNKING
+  UAV allocates the full upscaled output as one cuda:0 float32 tensor before
+  iterating. For a 640×480 @ 30 fps source that's ~1.6 GiB/sec at 4× upscale,
+  so > ~6 s of 480p won't fit. In `auto` mode we ffmpeg-split the input at the
+  largest size that fits the budget (UAV_OUTPUT_BUDGET_BYTES, default 10 GiB),
+  run UAV per chunk (resumable — existing chunk outputs are reused), and concat
+  with libx264 CRF 18. Use --no-chunk for the legacy single-shot behaviour.
+
 EXAMPLES
   uav clip.mp4 ./out
   uav clip.mp4 ./out --deep                                # max quality
-  uav clip.mp4 ./out --device 1                            # second 3090
+  uav clip.mp4 ./out --chunk 10                            # force 10-second chunks
+  uav clip.mp4 ./out --no-chunk                            # legacy single-shot (OOM for long clips)
   uav clip.mp4 ./out --prompt "vintage 1980s home video, film grain"
   uav clip.mp4 ./out -- -n 150 -g 8 -s 50 --color_fix Wavelet
 EOF
@@ -60,6 +81,8 @@ PROMPT=""
 NEG_PROMPT=""
 DO_SHELL=0
 RETAG_MODE="auto"   # auto | force | off
+CHUNK_MODE="auto"   # auto | off | <int seconds>
+CLEAN_CHUNKS=0
 EXTRA=()
 POSITIONAL=()
 PASSTHROUGH=0
@@ -83,6 +106,9 @@ while [[ $# -gt 0 ]]; do
     --neg-prompt)           NEG_PROMPT="$2"; shift 2 ;;
     --retag)                RETAG_MODE="force"; shift ;;
     --no-retag)             RETAG_MODE="off"; shift ;;
+    --chunk)                CHUNK_MODE="$2"; shift 2 ;;
+    --no-chunk)             CHUNK_MODE="off"; shift ;;
+    --clean-chunks)         CLEAN_CHUNKS=1; shift ;;
     --)                     PASSTHROUGH=1; shift ;;
     -*)                     EXTRA+=("$1"); shift ;;
     *)                      POSITIONAL+=("$1"); shift ;;
@@ -109,6 +135,7 @@ INPUT_ABS="$(readlink -f -- "$INPUT")"
 [[ -e "$INPUT_ABS" ]] || { echo "uav: input not found: $INPUT_ABS" >&2; exit 1; }
 IN_DIR="$(dirname  -- "$INPUT_ABS")"
 IN_BASE="$(basename -- "$INPUT_ABS")"
+ORIG_BASE="$IN_BASE"   # preserve user-facing name across retag
 
 mkdir -p -- "$OUTPUT"
 OUT_ABS="$(readlink -f -- "$OUTPUT")"
@@ -127,14 +154,10 @@ mkdir -p "$CACHE_DIR"
 # ---------------------------------------------------------------------------
 # Auto-tag colorspace metadata.
 #
-# UAV reads video via torchvision.io.read_video → PyAV. Recent PyAV/swscale
-# refuses yuv420p→rgb24 conversion when the source lacks color_primaries /
-# transfer / colorspace tags, failing with "Resource temporarily unavailable".
-# We detect that and either bitstream-patch (for h264/hevc — instant, no
-# re-encode) or losslessly re-encode (other codecs). Tagged copies live in
-# $CACHE_DIR/tagged/ keyed by source size+mtime so repeat runs skip the work.
-#
-# Disable with --no-retag, force a re-tag with --retag.
+# UAV used to read video via torchvision.io.read_video → PyAV; container patch
+# #5 swapped that to cv2.VideoCapture, so this step is mostly cosmetic now
+# (cv2 doesn't care about colour tags). The bitstream patch is cheap and
+# cached, so we leave it on by default.
 # ---------------------------------------------------------------------------
 uav_needs_color_tags() {
   local f="$1" cs prim trc
@@ -162,7 +185,6 @@ uav_apply_color_tags() {
         -bsf:v "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1" \
         "$out" ;;
     *)
-      # fallback: lossless x264 re-encode with explicit bt709 tags
       ffmpeg -nostdin -hide_banner -loglevel warning -y -i "$in" \
         -map 0:v:0 -map 0:a? \
         -c:v libx264 -crf 0 -preset ultrafast \
@@ -176,12 +198,6 @@ if [[ "$RETAG_MODE" != "off" ]] && command -v ffmpeg >/dev/null && command -v ff
   codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
     -of csv=p=0 "$INPUT_ABS" 2>/dev/null || echo "")
 
-  # Decide whether to retag. For H.264/HEVC the BSF metadata patch is cheap
-  # (no re-encode, idempotent) so we always do it in auto mode — the older
-  # detect-then-tag approach missed partial/weird tags (e.g. bt709 colorspace
-  # but unknown range, or color_range=tv that PyAV's swscale still chokes on).
-  # For other codecs the retag is a lossless re-encode (slow + bulky), so we
-  # only do it when detection says it's needed.
   retag=0
   case "$RETAG_MODE" in
     force) retag=1 ;;
@@ -195,7 +211,6 @@ if [[ "$RETAG_MODE" != "off" ]] && command -v ffmpeg >/dev/null && command -v ff
   if [[ "$retag" == "1" ]]; then
     TAGGED_DIR="$CACHE_DIR/tagged"
     mkdir -p "$TAGGED_DIR"
-    # cache key: codec + size + mtime; collisions impossible in practice
     key=$(stat -c "%s-%Y" "$INPUT_ABS" 2>/dev/null || echo "0-0")
     tagged_name="${IN_BASE%.*}.bt709.${codec}.${key}.${IN_BASE##*.}"
     tagged_path="$TAGGED_DIR/$tagged_name"
@@ -213,10 +228,49 @@ if [[ "$RETAG_MODE" != "off" ]] && command -v ffmpeg >/dev/null && command -v ff
   fi
 fi
 
-# Build UAV argv
+# ---------------------------------------------------------------------------
+# Compute safe chunk size in seconds. Returns 0 when no chunking is needed.
+# Math: UAV allocates one float32 tensor of shape (1, 3, T, 4H, 4W) on cuda:0.
+# Bytes = T × 3 × (4H) × (4W) × 4 = 192 × H × W × T. Solve for T given budget.
+# ---------------------------------------------------------------------------
+uav_chunk_seconds() {
+  local f="$1"
+  python3 - "$f" "$UAV_OUTPUT_BUDGET_BYTES" <<'PY'
+import sys, subprocess, json
+path, budget = sys.argv[1], int(sys.argv[2])
+probe = subprocess.run([
+    "ffprobe", "-v", "error", "-select_streams", "v:0",
+    "-show_entries", "stream=width,height,r_frame_rate",
+    "-show_entries", "format=duration",
+    "-of", "json", path
+], capture_output=True, text=True, check=True)
+data = json.loads(probe.stdout)
+s = data["streams"][0]
+w, h = int(s["width"]), int(s["height"])
+num, den = s["r_frame_rate"].split("/")
+fps = int(num) / max(1, int(den))
+duration = float(data["format"]["duration"])
+total_frames = duration * fps
+per_frame = w * h * 16 * 3 * 4   # 4× scale, 3 ch, float32
+max_frames = max(1, budget // per_frame)
+if total_frames <= max_frames * 1.05:
+    print(0)
+else:
+    print(max(1, int(max_frames / fps)))
+PY
+}
+
+case "$CHUNK_MODE" in
+  off|0) CHUNK_SEC=0 ;;
+  auto)  CHUNK_SEC=$(uav_chunk_seconds "$INPUT_ABS") ;;
+  *)
+    [[ "$CHUNK_MODE" =~ ^[0-9]+$ ]] || {
+      echo "uav: --chunk needs auto|off|<seconds>, got '$CHUNK_MODE'" >&2; exit 1; }
+    CHUNK_SEC="$CHUNK_MODE" ;;
+esac
+
+# Build the static UAV argv (everything except -i / -o, added per-run below)
 ARGS=(
-  -i "/workspace/input/$IN_BASE"
-  -o "/workspace/output"
   --no_llava
   --color_fix "${COLOR_FIX:-AdaIn}"
   -n "${N_LEVEL:-120}"
@@ -228,34 +282,126 @@ if [[ $DEEP -eq 1 ]]; then
   [[ $USE_VIDEO_VAE -eq 1 ]] && ARGS+=( --use_video_vae )
 else
   ARGS+=( -s "${STEPS:-30}" )
-  # tile_size=128 is the smallest that works without UAV's tile-composition
-  # shape bug (64 errors at the end-of-row tiles). 256 OOMs at decode even
-  # with multi-GPU + bf16 + short_seq=1.
   [[ $NO_TILE -eq 0 ]] && ARGS+=( --perform_tile --tile_size 128 )
-  # --use_video_vae picks the lighter video VAE (vae_video, slices temporally
-  # via the short_seq=1 patch) instead of the 3D VAE which needs 65 GB.
   ARGS+=( --use_video_vae )
 fi
 [[ -n "$PROMPT"     ]] && ARGS+=( --a_prompt "$PROMPT" )
 [[ -n "$NEG_PROMPT" ]] && ARGS+=( --n_prompt "$NEG_PROMPT" )
-
 ARGS+=( "${EXTRA[@]}" )
 
-# CUDA device pinning
 ENV_FLAGS=()
 if [[ -n "$DEVICE" ]]; then
   ENV_FLAGS+=( -e "CUDA_VISIBLE_DEVICES=$DEVICE" )
 fi
 
-echo "→ uav: $IN_BASE → $OUT_ABS"
-[[ $DEEP -eq 1 ]] && echo "  (--deep: untiled, 50 steps)"
+# Run UAV against ONE input file, writing to ONE output dir
+uav_run_one() {
+  local in_path="$1" out_dir="$2"
+  local in_dir in_base
+  in_dir="$(dirname  -- "$in_path")"
+  in_base="$(basename -- "$in_path")"
+  mkdir -p -- "$out_dir"
+  podman run --rm -it \
+    --device nvidia.com/gpu=all --security-opt=label=disable \
+    "${ENV_FLAGS[@]}" \
+    -v "$MODELS_DIR/upscale_a_video":/opt/Upscale-A-Video/pretrained_models/upscale_a_video:ro \
+    -v "$in_dir":/workspace/input:ro \
+    -v "$out_dir":/workspace/output \
+    -v "$CACHE_DIR":/cache \
+    "$IMAGE" \
+    -i "/workspace/input/$in_base" \
+    -o "/workspace/output" \
+    "${ARGS[@]}"
+}
 
-exec podman run --rm -it \
-  --device nvidia.com/gpu=all --security-opt=label=disable \
-  "${ENV_FLAGS[@]}" \
-  -v "$MODELS_DIR/upscale_a_video":/opt/Upscale-A-Video/pretrained_models/upscale_a_video:ro \
-  -v "$IN_DIR":/workspace/input:ro \
-  -v "$OUT_ABS":/workspace/output \
-  -v "$CACHE_DIR":/cache \
-  "$IMAGE" \
-  "${ARGS[@]}"
+# ---------------------------------------------------------------------------
+# Single-shot path (chunking off or video small enough).
+# ---------------------------------------------------------------------------
+if (( CHUNK_SEC == 0 )); then
+  echo "→ uav: $IN_BASE → $OUT_ABS"
+  [[ $DEEP -eq 1 ]] && echo "  (--deep: untiled, 50 steps)"
+  uav_run_one "$INPUT_ABS" "$OUT_ABS"
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Chunked path. Split input losslessly (libx264 -crf 0 -g 1 for clean cuts),
+# run UAV per chunk into its own subdir (so we know which output is whose),
+# concat with libx264 CRF 18. Resumable: chunks whose output already exists
+# are skipped. Staging dir is keyed by input size+mtime so resumes find it.
+# ---------------------------------------------------------------------------
+key=$(stat -c "%s-%Y" "$INPUT_ABS" 2>/dev/null || echo "0-0")
+STAGE_DIR="$CACHE_DIR/chunks/${IN_BASE%.*}.${key}.c${CHUNK_SEC}s"
+mkdir -p "$STAGE_DIR"
+SEG_DIR="$STAGE_DIR/seg"
+OUT_SEG_DIR="$STAGE_DIR/upscaled"
+mkdir -p "$SEG_DIR" "$OUT_SEG_DIR"
+
+# STAGE_DIR is intentionally kept across exits so a Ctrl-C or chunk failure
+# can resume on re-run. Use --clean-chunks to remove it after a clean concat,
+# or `rm -rf "$STAGE_DIR"` afterwards.
+
+# Total estimated chunk count for progress
+nframes=$(ffprobe -v error -select_streams v:0 -count_frames \
+  -show_entries stream=nb_read_frames -of csv=p=0 "$INPUT_ABS" 2>/dev/null || echo "0")
+echo "→ uav: input is $nframes frames, splitting into ${CHUNK_SEC}-second chunks"
+
+# Split only if we don't already have segments from a prior run
+if ! compgen -G "$SEG_DIR/seg_*.mp4" > /dev/null; then
+  ffmpeg -nostdin -hide_banner -loglevel warning -y -i "$INPUT_ABS" \
+    -c:v libx264 -preset ultrafast -crf 0 -g 1 -an \
+    -f segment -segment_time "$CHUNK_SEC" -reset_timestamps 1 \
+    "$SEG_DIR/seg_%04d.mp4"
+fi
+
+shopt -s nullglob
+SEGS=( "$SEG_DIR"/seg_*.mp4 )
+shopt -u nullglob
+n=${#SEGS[@]}
+(( n > 0 )) || { echo "uav: ffmpeg split produced no segments" >&2; exit 1; }
+echo "→ uav: $n chunks to process"
+
+i=0
+for seg in "${SEGS[@]}"; do
+  i=$((i + 1))
+  chunk_out_dir="$OUT_SEG_DIR/$(basename "$seg" .mp4)"
+  mkdir -p "$chunk_out_dir"
+  # UAV writes outputs to <out>/video/<stem>_n..g..s...mp4
+  # resume: skip if UAV already wrote a non-empty .mp4 in that subdir
+  existing=$(find "$chunk_out_dir/video" -maxdepth 1 -name '*.mp4' -size +0c -print -quit 2>/dev/null || true)
+  if [[ -n "$existing" ]]; then
+    echo "  ✓ chunk $i/$n: $(basename "$seg") (cached → $(basename "$existing"))"
+    continue
+  fi
+  echo "  ▶ chunk $i/$n: $(basename "$seg")"
+  uav_run_one "$seg" "$chunk_out_dir" || {
+    echo "uav: chunk $i/$n failed; resume by re-running the same uav command" >&2
+    exit 1
+  }
+done
+
+# Build concat list from each chunk's output
+CONCAT_LIST="$STAGE_DIR/concat.txt"
+: > "$CONCAT_LIST"
+for seg in "${SEGS[@]}"; do
+  chunk_out_dir="$OUT_SEG_DIR/$(basename "$seg" .mp4)"
+  produced=$(find "$chunk_out_dir/video" -maxdepth 1 -name '*.mp4' -size +0c | sort | head -1)
+  [[ -n "$produced" ]] || { echo "uav: no output found in $chunk_out_dir/video" >&2; exit 1; }
+  printf "file '%s'\n" "$produced" >> "$CONCAT_LIST"
+done
+
+FINAL_NAME="${ORIG_BASE%.*}_uav.mp4"
+FINAL_PATH="$OUT_ABS/$FINAL_NAME"
+echo "→ uav: concatenating $n chunks → $FINAL_PATH"
+ffmpeg -nostdin -hide_banner -loglevel warning -y \
+  -f concat -safe 0 -i "$CONCAT_LIST" \
+  -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p \
+  "$FINAL_PATH"
+
+echo "✓ uav: $FINAL_PATH"
+if [[ $CLEAN_CHUNKS -eq 1 ]]; then
+  rm -rf -- "$STAGE_DIR"
+  echo "  (staging dir removed: $STAGE_DIR)"
+else
+  echo "  (staging dir kept: $STAGE_DIR — pass --clean-chunks to auto-remove)"
+fi

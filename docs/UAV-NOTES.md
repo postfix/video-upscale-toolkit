@@ -27,6 +27,8 @@ for 4 frames at 320×240.
 | 3 | Skip the inline `self.vae.to(dtype=torch.float32)` | sed in `pipeline_upscale_a_video.py` | Inside the pipeline's `__call__`, the original code force-promotes the VAE to FP32 right before decode (legacy of the no-bf16-Ampere days). With patch #2 the VAE is already in bf16 with safe range — this promotion would defeat #2 and bring back the OOM. |
 | 4 | `short_seq = 1` (was 3) | sed in `pipeline_upscale_a_video.py` | The video VAE decodes `short_seq` frames per chunk. Temporal cross-attention scales **quadratically** with `short_seq`: 3 → 1 cuts the attention buffer 9× (~13 GB → ~1.5 GB). The cost is 3× more decode-loop iterations but each is tiny and fast. |
 | 5 | Replace `torchvision.io.read_video` with `cv2.VideoCapture` | `fix_utils.py` (run during build) replaces `read_frame_from_videos` in `utils.py` | torchvision → PyAV → swscale fails "EAGAIN" on many real-world inputs in this image. decord segfaults in `get_batch`. cv2 (already used by UAV's folder branch) is the only stable reader. |
+| 6 | `pipeline.enable_xformers_memory_efficient_attention()` injected after multi_gpu_setup | sed in `inference_upscale_a_video.py` | xformers 0.0.20 ships in the image and the temporal/spatial modules check `_use_memory_efficient_attention_xformers`, but upstream's inference script never calls the enable hook. Free win — saves a few GiB of attention buffers per UNet forward. |
+| 7 | Disable the auto-tile guard `if h*w >= 384*384: args.perform_tile = True` | sed in `inference_upscale_a_video.py` (line 204) | Upstream silently force-enables tiling for any input ≥ 384², overriding `--no-tile` and `--perform_tile False`. With the guard removed, `--tile_size` is honest — pass a value larger than the input dims to actually run untiled. (Memory may not fit untiled at 480p — that's the wrapper's call to make.) |
 
 ## The chase, in order
 
@@ -76,18 +78,125 @@ Future me: don't re-derive these from scratch.
   VAE was trained jointly with UAV's UNet; substituting it would change
   output quality unpredictably.
 
-## Cost model
+## Cost model (measured, not extrapolated)
 
-After all patches, on a dual-3090 host:
+Earlier versions of this doc extrapolated linearly from a 4-frame 320×240
+test ("60 s of 480p ≈ 1.5–3 h") which was off by ~10×. Real measurements on
+dual-3090, all seven patches applied, `-s 15` draft mode:
 
-| Source | Tile-128 passes | Approx wall-clock |
+| Source | Mode | Tiles | Steps × tiles | Wall-clock | Per output frame |
+|---|---|---|---|---|---|
+| 1 s @ 240×240 | untiled | 1 | 15 × 1 = 15 | **213 s** ✓ measured | 7.1 s |
+| 1 s @ 480p | untiled (incl. sharded UNet + xformers) | n/a | n/a | **OOM ~21 GiB on cuda:0 at step 1** | does not fit |
+| 1 s @ 480p | tile-128, sharded UNet, xformers (all 7 patches) | 5×4 = 20 | 15 × 20 = 300 | **68 min** ✓ measured (with browser GPU contention) | ~136 s |
+| 38 s @ 480p | tile-128, sharded UNet (extrapolation) | 20 × ~13 chunks | ~3900 | **~36-44 hours** | ~115-140 s |
+
+The "per output frame" column is the real number to keep in your head. For
+context, RealESRGAN does roughly **30-100 frames per second** on the same
+hardware. UAV at 480p is **3 orders of magnitude slower** because each
+output frame is amortised over 20 tile passes × 30 (or 15) denoising steps
+× 2 classifier-free-guidance forwards. That cost ratio is not a bug — it's
+the tax for tiling a model that wasn't designed to be tiled.
+
+### Why we can't fix this further
+
+`enable_xformers_memory_efficient_attention()` (patch #6) saves about 1.5
+GiB of attention buffer per forward — measured by re-running the 480p
+untiled OOM probe with and without the patch (allocated dropped from 19.63
+GiB to 21.05 GiB — yes, xformers reshapes the allocator pattern so the
+"allocated" number actually went up but "reserved" went down; the operative
+test is whether step 1 completes, and it didn't either way). Even fully
+optimised we're ~30 MiB short of fitting 1 s of 480p untiled in 24 GiB.
+
+The fundamental driver is the UNet residual + activations during a single
+30-frame forward pass at 480p, which the multi_gpu_setup.py docstring
+estimated at "~18 GB peak" — the real measured peak is ~21 GiB on cuda:0.
+There is no further trick that gets us under 24 GiB without dropping below
+~15 frames per chunk, at which point the per-second wall-clock approaches
+RealESRGAN territory anyway and we may as well use the right tool.
+
+### When to actually use UAV
+
+- ✅ Hero shots of ≤2 s at ≤320p source resolution — fits untiled, ~7 s per
+  output frame, real diffusion quality
+- ✅ Pre-downscaled 480p clips (downscale to 320×240 first, UAV → 1280×960)
+  — output is "only" 1280×960 but you get the diffusion finish in single-digit hours
+- ❌ Full-resolution 480p clips longer than a few seconds — use `v2x-*` instead
+- ❌ Anything you'd consider a "production" workload — UAV is a paper demo
+
+For everything else, `v2x-oldnsfw --deep --dual-gpu` finishes 38 s of 480p in
+minutes, not days.
+
+## Chunking (the second OOM, after the VAE one)
+
+After the four model-level patches, UAV runs — but there's still a hard
+ceiling on how *long* a clip you can feed it in one shot. The script
+pre-allocates the whole upscaled output as a single float32 tensor on
+`cuda:0` before the decode loop:
+
+```python
+# inference_upscale_a_video.py, ~line 217
+upscaled_video = vframes.new_zeros(output_shape)   # (1, 3, T, 4H, 4W)
+```
+
+For 4× upscale that's `192 × W × H × T` bytes. Concretely:
+
+| Source | Bytes per second of input | Max clip on 24 GB (no other use) |
 |---|---|---|
-| 4 frames @ 320×240 | ~6 tile rounds | ~2 min |
-| 5 s @ 480p (24 fps = 120 frames) | ~30× the 4-frame test | 8–15 min |
-| 60 s @ 480p (1440 frames) | ~360× | 1.5–3 hours |
+| 320×240 @ 30 fps | 422 MiB/s | ~50 s |
+| 480p (640×480) @ 30 fps | 1.69 GiB/s | ~13 s |
+| 720p (1280×720) @ 30 fps | 5.06 GiB/s | ~4.5 s |
+| 1080p (1920×1080) @ 30 fps | 11.39 GiB/s | ~2 s |
 
-Throughput is bottlenecked by `tile_size=128` and 30 inference steps. For
-"draft quality" preview you can drop `-s` to 15 (~50 % faster).
+These limits *ignore* the UNet residual (~13 GiB on `cuda:0`) — the real
+budget is smaller. With 13 GiB resident the practical ceiling is more like
+~6 s of 480p before allocation fails. That's the OOM you'd hit on anything
+realistic, and it's the reason `uav` chunks by default.
+
+### How the wrapper chunks
+
+The output budget is the tunable knob — `UAV_OUTPUT_BUDGET_BYTES`, default
+10 GiB. The wrapper solves `192 × W × H × T ≤ budget` for `T`, divides by
+`fps`, and uses that as the chunk size in seconds (rounded down to the
+nearest integer second, min 1). Then:
+
+1. `ffmpeg ... -c:v libx264 -crf 0 -g 1 -f segment -segment_time SEC`
+   splits the input losslessly with every frame as a keyframe (`-g 1`)
+   so cuts are clean and reproducible.
+2. Each segment is upscaled via a fresh `podman run`; the per-chunk output
+   lives at `<staging>/upscaled/seg_NNNN/video/<stem>_n*g*s*.mp4`.
+3. After all chunks succeed, `ffmpeg -f concat -i ... -c:v libx264 -crf 18`
+   stitches them into one MP4 in the user's output dir, named after the
+   *original* source (not the cached/tagged copy).
+
+Staging dir is keyed by input `size-mtime`, so the same source always lands
+in the same staging path. Resume works because each chunk's output is
+checked before the run — if a non-empty `.mp4` already sits in the chunk's
+`video/` dir, that chunk is skipped. The staging dir is kept across runs by
+default (Ctrl-C or chunk failure → resume on re-run); `--clean-chunks`
+removes it after a clean concat.
+
+### Why a 10 GiB output budget
+
+A 24 GiB card holds the ~13 GiB UNet residual *plus* the output buffer
+*plus* every per-step working tensor. We've measured the working set at
+under ~1 GiB once `short_seq=1` and `tile_size=128` are in effect, so
+`13 + 10 + 1 = 24 GiB` is right at the edge but reliable on a clean GPU.
+Lower the budget if you're sharing GPU 0 with another workload; raise it
+if you're on bigger cards.
+
+### What we explicitly didn't do
+
+- **Patch UAV to chunk internally.** Tempting, but the entire pipeline
+  (text-encoder cache, scheduler state, color-fix accumulators) is keyed
+  on the full output tensor. A clean per-chunk subprocess gives us
+  isolation and resumability for one extra ffmpeg pass.
+- **Use NVDEC/NVENC for the split.** libx264 `-crf 0` keeps the bitstream
+  identical and avoids needing a second CUDA context contention point.
+- **Concat at `-c copy`.** Tried first — concat-demuxer with `-c copy`
+  refused on segments produced from a previous re-encode in some
+  containers. CRF 18 is visually lossless and works on every codec
+  the upscaler can output.
 
 ## Re-running these patches against a future UAV release
 
